@@ -13,7 +13,18 @@ import threading
 import queue
 import time
 import math
-from collections import defaultdict
+
+# Performance constants
+ANIMATION_INTERVAL_MS = 50  # 20 FPS animation
+STATS_UPDATE_INTERVAL_MS = 500
+ACTIVATION_THRESHOLD = 0.1  # Minimum activation for animation
+MAX_EDGE_WIDTH = 4
+MIN_EDGE_WIDTH = 1
+WEIGHT_SCALE_FACTOR = 2.0  # For color intensity
+WEIGHT_WIDTH_FACTOR = 3.0
+
+# Pre-computed color lookup for performance
+_COLOR_CACHE: Dict[Tuple[float, str], str] = {}
 
 
 @dataclass
@@ -157,6 +168,13 @@ class NetworkCanvas(tk.Canvas):
         self.update_count = 0
         self.last_update_time = time.time()
         self.fps = 0
+        self._frame_times: List[float] = []  # For accurate FPS calculation
+        
+        # Active nodes cache for animation optimization
+        self._active_nodes: List[Node] = []
+        
+        # Node glow items for efficient updates
+        self.node_glow_items: Dict[str, int] = {}
         
         # Zoom/Pan functionality
         self.zoom_level = 1.0
@@ -181,38 +199,46 @@ class NetworkCanvas(tk.Canvas):
         # Start animation loop
         self._animate()
     
-    def create_gradient_circle(self, x, y, radius, color_inner, color_outer):
-        """Create a gradient-filled circle using multiple ovals"""
-        items = []
-        steps = 8
-        for i in range(steps, 0, -1):
-            r = radius * i / steps
-            # Interpolate color
-            ratio = i / steps
-            
-            # Parse colors
-            r1, g1, b1 = self._hex_to_rgb(color_inner)
-            r2, g2, b2 = self._hex_to_rgb(color_outer)
-            
-            # Interpolate
-            rf = int(r1 + (r2 - r1) * ratio)
-            gf = int(g1 + (g2 - g1) * ratio)
-            bf = int(b1 + (b2 - b1) * ratio)
-            
-            color = f'#{rf:02x}{gf:02x}{bf:02x}'
-            
-            item = self.create_oval(
-                x - r, y - r, x + r, y + r,
-                fill=color, outline=''
-            )
-            items.append(item)
-        
-        return items
-    
-    def _hex_to_rgb(self, hex_color):
-        """Convert hex color to RGB tuple"""
+    @staticmethod
+    def _hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
+        """Convert hex color to RGB tuple - cached for performance"""
         hex_color = hex_color.lstrip('#')
-        return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+        return (int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16))
+    
+    @staticmethod
+    def _get_weight_color(weight: float, positive_color: str, negative_color: str, neutral_color: str) -> str:
+        """Get color for weight value with caching"""
+        # Round weight for cache efficiency
+        cache_key = (round(weight, 2), 'w')
+        if cache_key in _COLOR_CACHE:
+            return _COLOR_CACHE[cache_key]
+        
+        if weight > 0:
+            intensity = min(abs(weight) * WEIGHT_SCALE_FACTOR, 1.0)
+            r, g, b = 0, int(255 * intensity), int(136 * intensity)
+        elif weight < 0:
+            intensity = min(abs(weight) * WEIGHT_SCALE_FACTOR, 1.0)
+            r, g, b = int(255 * intensity), int(71 * intensity), int(87 * intensity)
+        else:
+            # Parse neutral color
+            r, g, b = NetworkCanvas._hex_to_rgb(neutral_color)
+        
+        color = f'#{r:02x}{g:02x}{b:02x}'
+        
+        # Cache management - limit size
+        if len(_COLOR_CACHE) > 1000:
+            _COLOR_CACHE.clear()
+        _COLOR_CACHE[cache_key] = color
+        return color
+    
+    def create_node_visual(self, x: float, y: float, radius: float, color: str) -> int:
+        """Create a single efficient node visual (replaces gradient circles)"""
+        # Single filled oval with outline for visual depth
+        item = self.create_oval(
+            x - radius, y - radius, x + radius, y + radius,
+            fill=color, outline='#1e272e', width=2
+        )
+        return item
     
     def draw_network(self, layers: List[Layer], edges: List[Edge]):
         """Draw the entire network"""
@@ -235,30 +261,31 @@ class NetworkCanvas(tk.Canvas):
         self._draw_layer_labels()
     
     def _draw_edges(self):
-        """Draw connections between nodes with weight visualization"""
+        """Draw connections between nodes with weight visualization - optimized"""
         self.edge_items = []  # List of canvas item IDs
-        self.edge_to_canvas = {}  # Map edge object id to canvas item
+        self.edge_to_canvas = {}  # Map edge index to canvas item
         
-        for edge in self.edges:
-            source = self._find_node(edge.source_id)
-            target = self._find_node(edge.target_id)
+        # Build node lookup dict for O(1) access from layers (not self.nodes which may be empty)
+        node_lookup = {}
+        for layer in self.layers:
+            for node in layer.nodes:
+                node_lookup[node.id] = node
+        
+        for idx, edge in enumerate(self.edges):
+            source = node_lookup.get(edge.source_id)
+            target = node_lookup.get(edge.target_id)
             
             if source and target:
-                # Calculate color and width based on weight
-                weight = edge.weight
+                # Use cached color calculation
+                color = self._get_weight_color(
+                    edge.weight,
+                    self.colors['positive'],
+                    self.colors['negative'],
+                    self.colors['edge']
+                )
                 
-                # Color: positive = green, negative = red, zero = gray
-                if weight > 0:
-                    intensity = min(abs(weight) * 2, 1.0)  # Scale up for visibility
-                    color = f'#{int(0 * intensity):02x}{int(255 * intensity):02x}{int(136 * intensity):02x}'
-                elif weight < 0:
-                    intensity = min(abs(weight) * 2, 1.0)
-                    color = f'#{int(255 * intensity):02x}{int(71 * intensity):02x}{int(87 * intensity):02x}'
-                else:
-                    color = self.colors['edge']
-                
-                # Width: thicker for larger weights (1-4 pixels)
-                width = max(1, min(4, abs(weight) * 3 + 0.5))
+                # Width: thicker for larger weights
+                width = max(MIN_EDGE_WIDTH, min(MAX_EDGE_WIDTH, abs(edge.weight) * WEIGHT_WIDTH_FACTOR + 0.5))
                 
                 line = self.create_line(
                     source.x, source.y, target.x, target.y,
@@ -267,27 +294,26 @@ class NetworkCanvas(tk.Canvas):
                     smooth=True
                 )
                 
-                # Store canvas item IDs
+                # Store canvas item IDs using edge index (stable reference)
                 self.edge_items.append(line)
-                self.edge_to_canvas[id(edge)] = line
+                self.edge_to_canvas[idx] = line
     
     def _draw_nodes(self):
-        """Draw all nodes with click bindings"""
+        """Draw all nodes with click bindings - optimized single-oval approach"""
+        self._active_nodes = []  # Reset active nodes cache
+        
         for layer in self.layers:
             for node in layer.nodes:
                 self.nodes[node.id] = node
                 
-                # Create gradient circle
-                items = self.create_gradient_circle(
+                # Create single efficient node visual
+                node_item = self.create_node_visual(
                     node.x, node.y, node.radius,
-                    self.colors['neutral'],
-                    '#1e272e'
+                    self.colors['neutral']
                 )
+                self.node_items[node.id] = node_item
                 
-                # Store the outermost circle for updates
-                self.node_items[node.id] = items[-1]
-                
-                # Add glow effect
+                # Add glow effect (separate item for animation)
                 glow = self.create_oval(
                     node.x - node.radius - 5,
                     node.y - node.radius - 5,
@@ -297,6 +323,7 @@ class NetworkCanvas(tk.Canvas):
                     width=2,
                     stipple='gray50'
                 )
+                self.node_glow_items[node.id] = glow
                 
                 # Create larger invisible clickable area for easier selection
                 click_area = self.create_oval(
@@ -306,11 +333,9 @@ class NetworkCanvas(tk.Canvas):
                     node.y + node.radius + 15,
                     fill='', outline='', tags=f'clickable_{node.id}'
                 )
+                # Bind click event
                 self.tag_bind(f'clickable_{node.id}', '<Button-1>', lambda e, n=node: self._on_node_click(e, n))
-                
-                # Also bind to visual items
-                for item in items:
-                    self.tag_bind(item, '<Button-1>', lambda e, n=node: self._on_node_click(e, n))
+                self.tag_bind(node_item, '<Button-1>', lambda e, n=node: self._on_node_click(e, n))
     
     def _on_node_click(self, event, node: Node):
         """Handle node click with multi-selection support"""
@@ -382,12 +407,8 @@ class NetworkCanvas(tk.Canvas):
             self.layer_labels[layer.id] = label
     
     def _find_node(self, node_id: str) -> Optional[Node]:
-        """Find a node by ID"""
-        for layer in self.layers:
-            for node in layer.nodes:
-                if node.id == node_id:
-                    return node
-        return None
+        """Find a node by ID - O(1) lookup"""
+        return self.nodes.get(node_id)
     
     def update_activations(self, activations: Dict[str, np.ndarray]):
         """Update node colors based on activations"""
@@ -405,104 +426,112 @@ class NetworkCanvas(tk.Canvas):
                         self._update_node_color(node)
     
     def _update_node_color(self, node: Node):
-        """Update a single node's color based on activation"""
+        """Update a single node's color based on activation - no recreation"""
         if node.id not in self.node_items:
             return
         
         # Normalize activation to [-1, 1]
         act = np.tanh(node.activation)
         
-        # Determine color
+        # Determine color using cached lookup
         if act > 0:
-            color = self.colors['positive']
-            intensity = min(abs(act) + 0.3, 1.0)
+            r = int(min(abs(act) + 0.3, 1.0) * 0)
+            g = int(min(abs(act) + 0.3, 1.0) * 255)
+            b = int(min(abs(act) + 0.3, 1.0) * 136)
         elif act < 0:
-            color = self.colors['negative']
-            intensity = min(abs(act) + 0.3, 1.0)
+            r = int(min(abs(act) + 0.3, 1.0) * 255)
+            g = int(min(abs(act) + 0.3, 1.0) * 71)
+            b = int(min(abs(act) + 0.3, 1.0) * 87)
         else:
-            color = self.colors['neutral']
-            intensity = 0.5
+            r, g, b = self._hex_to_rgb(self.colors['neutral'])
         
-        # Update node appearance
+        color = f'#{r:02x}{g:02x}{b:02x}'
+        
+        # Update in-place without recreating (MAJOR PERFORMANCE WIN)
         item_id = self.node_items[node.id]
+        self.itemconfig(item_id, fill=color)
         
-        # Create new gradient
-        self.delete(item_id)
-        items = self.create_gradient_circle(
-            node.x, node.y,
-            node.radius + abs(act) * 5,
-            color,
-            '#1e272e'
-        )
-        self.node_items[node.id] = items[-1]
+        # Update size for activation magnitude
+        new_radius = node.radius + abs(act) * 5
+        self.coords(item_id, 
+                    node.x - new_radius, node.y - new_radius,
+                    node.x + new_radius, node.y + new_radius)
         
-        # Raise above edges
-        for item in items:
-            self.tag_raise(item)
+        # Update glow if exists
+        if node.id in self.node_glow_items:
+            glow_id = self.node_glow_items[node.id]
+            glow_radius = new_radius + 5
+            self.coords(glow_id,
+                        node.x - glow_radius, node.y - glow_radius,
+                        node.x + glow_radius, node.y + glow_radius)
+            self.itemconfig(glow_id, outline=color)
+        
+        # Track active nodes for optimized animation
+        if abs(node.activation) > ACTIVATION_THRESHOLD:
+            if node not in self._active_nodes:
+                self._active_nodes.append(node)
+        elif node in self._active_nodes:
+            self._active_nodes.remove(node)
     
     def update_weights(self, weights: Dict[str, np.ndarray]):
-        """Update edge colors and widths based on weights"""
-        # Convert weight dictionary to list in layer order
-        weight_list = []
-        for key in sorted(weights.keys()):
-            if 'weight' in key:
-                weight_list.append(weights[key])
+        """Update edge colors and widths based on weights - optimized"""
+        # Convert weight dictionary to list in layer order (cached approach)
+        weight_list = [weights[key] for key in sorted(weights.keys()) if 'weight' in key]
         
-        # Update edge weights from weight matrices
-        for edge in self.edges:
+        if not weight_list:
+            return
+        
+        # Batch update edge weights from weight matrices
+        for idx, edge in enumerate(self.edges):
             layer_idx = edge.layer_index - 1  # Adjust for layer indexing
-            if layer_idx >= 0 and layer_idx < len(weight_list):
+            if 0 <= layer_idx < len(weight_list):
                 weight_matrix = weight_list[layer_idx]
                 if edge.target_idx < weight_matrix.shape[0] and edge.source_idx < weight_matrix.shape[1]:
                     edge.weight = float(weight_matrix[edge.target_idx, edge.source_idx])
             
-            if id(edge) in self.edge_to_canvas:
-                canvas_item = self.edge_to_canvas[id(edge)]
-                weight = edge.weight
+            if idx in self.edge_to_canvas:
+                canvas_item = self.edge_to_canvas[idx]
                 
-                # Calculate color based on weight
-                if weight > 0:
-                    intensity = min(abs(weight) * 2, 1.0)
-                    color = f'#{int(0 * intensity):02x}{int(255 * intensity):02x}{int(136 * intensity):02x}'
-                elif weight < 0:
-                    intensity = min(abs(weight) * 2, 1.0)
-                    color = f'#{int(255 * intensity):02x}{int(71 * intensity):02x}{int(87 * intensity):02x}'
-                else:
-                    color = self.colors['edge']
+                # Use cached color calculation
+                color = self._get_weight_color(
+                    edge.weight,
+                    self.colors['positive'],
+                    self.colors['negative'],
+                    self.colors['edge']
+                )
                 
                 # Calculate width based on weight magnitude
-                width = max(1, min(4, abs(weight) * 3 + 0.5))
+                width = max(MIN_EDGE_WIDTH, min(MAX_EDGE_WIDTH, abs(edge.weight) * WEIGHT_WIDTH_FACTOR + 0.5))
                 
                 # Update the line
                 self.itemconfig(canvas_item, fill=color, width=width)
     
     def _animate(self):
-        """Animation loop for pulsing effects"""
+        """Animation loop for pulsing effects - optimized to only update active nodes"""
         self.pulse_phase += self.animation_speed
         
-        # Animate active nodes
-        for node in self.nodes.values():
-            if abs(node.activation) > 0.1:
-                pulse = math.sin(self.pulse_phase + node.index * 0.5) * 0.1 + 1.0
-                radius = node.radius * pulse
-                
-                if node.id in self.node_items:
-                    item_id = self.node_items[node.id]
-                    coords = self.coords(item_id)
-                    if coords:
-                        cx = (coords[0] + coords[2]) / 2
-                        cy = (coords[1] + coords[3]) / 2
-                        self.coords(item_id, cx - radius, cy - radius, cx + radius, cy + radius)
+        # Only animate nodes with significant activation (cached list)
+        for node in self._active_nodes:
+            pulse = math.sin(self.pulse_phase + node.index * 0.5) * 0.1 + 1.0
+            radius = node.radius * pulse
+            
+            if node.id in self.node_items:
+                item_id = self.node_items[node.id]
+                # Direct coordinate update without fetching current coords
+                self.coords(item_id, 
+                           node.x - radius, node.y - radius, 
+                           node.x + radius, node.y + radius)
         
-        # Update FPS counter
-        self.update_count += 1
+        # Update FPS counter using frame time tracking
         current_time = time.time()
-        if current_time - self.last_update_time >= 1.0:
-            self.fps = self.update_count
-            self.update_count = 0
-            self.last_update_time = current_time
+        self._frame_times.append(current_time)
         
-        self.after(50, self._animate)  # 20 FPS animation
+        # Keep only last second of frame times
+        cutoff = current_time - 1.0
+        self._frame_times = [t for t in self._frame_times if t > cutoff]
+        self.fps = len(self._frame_times)
+        
+        self.after(ANIMATION_INTERVAL_MS, self._animate)
     
     def get_fps(self) -> int:
         """Get current FPS"""
@@ -1142,15 +1171,20 @@ class TkinterNeuralVisualizer:
         return params
     
     def _update_loop(self):
-        """Background thread for processing updates"""
+        """Background thread for processing updates - optimized"""
         while self.is_running:
+            # Skip processing if paused
+            if getattr(self, '_paused', False):
+                time.sleep(0.05)  # Longer sleep when paused to reduce CPU
+                continue
+            
             try:
-                update_data = self.update_queue.get(timeout=0.01)
+                # Block for 50ms max - no additional sleep needed
+                update_data = self.update_queue.get(timeout=0.05)
                 if update_data is not None:
                     self._apply_update(update_data)
             except queue.Empty:
-                pass
-            time.sleep(0.001)
+                pass  # No pending updates, loop back
     
     def _apply_update(self, update_data: Dict):
         """Apply update to visualization"""
@@ -1185,9 +1219,9 @@ class TkinterNeuralVisualizer:
     
     def _schedule_ui_update(self):
         """Schedule periodic UI updates"""
-        if self.is_running:
+        if self.is_running and not getattr(self, '_paused', False):
             self._update_stats()
-            self.root.after(500, self._schedule_ui_update)
+            self.root.after(STATS_UPDATE_INTERVAL_MS, self._schedule_ui_update)
     
     def _update_stats(self):
         """Update statistics display"""
@@ -1203,8 +1237,15 @@ class TkinterNeuralVisualizer:
     
     def _toggle_pause(self):
         """Toggle pause/resume"""
-        # Implementation for pausing updates
-        pass
+        if hasattr(self, '_paused') and self._paused:
+            self._paused = False
+            self.pause_btn.config(text="Pause")
+            self.status_label.config(text="Status: Running")
+            self._schedule_ui_update()
+        else:
+            self._paused = True
+            self.pause_btn.config(text="Resume")
+            self.status_label.config(text="Status: Paused")
     
     def _reset_view(self):
         """Reset view"""
