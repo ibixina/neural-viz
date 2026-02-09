@@ -1,0 +1,21 @@
+# Neural Network Visualizer Requirements
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+numpy>=1.24.0
+
+# Visualization dependencies
+matplotlib>=3.7.0
+
+# Web server dependencies (for web-based visualization)
+flask>=2.3.0
+flask-socketio>=5.3.0
+
+# Optional: Deep Learning Frameworks
+# Uncomment the one(s) you need:
+
+# PyTorch support
+torch>=2.0.0
+
+# TensorFlow support (not available for Python 3.14)
+# tensorflow>=2.13.0
